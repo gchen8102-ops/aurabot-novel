@@ -111,6 +111,7 @@ v1.2.0  看小说 1.2.0 —— 支持图片版漫画 PDF
 
 v1.2.1  人物卡简繁 / 别名去重（本补丁在 1.2.0 发布后修复）
         https://github.com/gchen8102-ops/aurabot-novel/releases/tag/v1.2.1
+        附件 aurabot-novel-1.2.1.zip（70,124 B，SHA256 564F8F46…373672，下载回来与本地一致）
 ```
 
 ---
