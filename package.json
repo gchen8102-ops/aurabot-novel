@@ -1,0 +1,49 @@
+﻿{
+  "name": "aurabot-novel",
+  "version": "1.1.0",
+  "description": "Aurabot 扩展模块「看小说」：读 txt / docx / epub / pdf，拆出人物的性格、说话和做事方式，学书里角色说话。",
+  "type": "module",
+  "main": "index.mjs",
+  "files": [
+    "index.mjs",
+    "ops.mjs",
+    "store.mjs",
+    "text.mjs",
+    "textutil.mjs",
+    "zip.mjs",
+    "epub.mjs",
+    "pdf.mjs",
+    "learn.mjs",
+    "style.mjs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test.mjs",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1"
+  },
+  "keywords": [
+    "aurabot",
+    "dsh",
+    "dsh-plugin",
+    "aurabot-module",
+    "novel",
+    "epub",
+    "pdf",
+    "reader",
+    "roleplay"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gchen8102-ops/aurabot-novel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/gchen8102-ops/aurabot-novel/issues"
+  },
+  "homepage": "https://github.com/gchen8102-ops/aurabot-novel#readme"
+}

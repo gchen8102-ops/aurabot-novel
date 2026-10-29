@@ -1,0 +1,19 @@
+# 本地测试产生的书和样书（别发布）
+.testdata/
+.testdata-real/
+.tmpfmt/
+1.txt
+.plain.txt
+
+# 备份文件
+*.bak
+*.bak-*
+
+# 一次性的开发脚本 / 旧版本副本（留本地，不进仓库）
+orig/
+frag/
+patch.mjs
+
+# 打出来的包
+dist/
+node_modules/
