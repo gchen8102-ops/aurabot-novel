@@ -1,7 +1,7 @@
-﻿{
+{
   "name": "aurabot-novel",
-  "version": "1.1.0",
-  "description": "Aurabot 扩展模块「看小说」：读 txt / docx / epub / pdf，拆出人物的性格、说话和做事方式，学书里角色说话。",
+  "version": "1.2.0",
+  "description": "Aurabot 扩展模块「看小说 / 漫画」：读 txt / docx / epub / pdf，图片版漫画 PDF 用视觉模型一页页看，拆出人物的性格、说话和做事方式，学书里角色说话。",
   "type": "module",
   "main": "index.mjs",
   "files": [
@@ -13,6 +13,7 @@
     "zip.mjs",
     "epub.mjs",
     "pdf.mjs",
+    "comic.mjs",
     "learn.mjs",
     "style.mjs",
     "README.md",

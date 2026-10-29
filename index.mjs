@@ -2,22 +2,23 @@
 // 保存就生效（几秒内自动重新加载），出错了去面板「扩展」页看原因；接口说明见同目录上一层的 API.md。
 //
 // 她会：
-//   · 把小说读进书架（txt / docx / epub / pdf；放到 shelf 文件夹 / 发 QQ 文件 / 导入本地路径或网址）
-//   · 分段读，拆出书里人物的性格、说话方式、做事风格和原话，整理成人物卡
+//   · 把小说 / 漫画读进书架（txt / docx / epub / pdf；放到 shelf 文件夹 / 发 QQ 文件 / 导入本地路径或网址）
+//   · 小说分段读；一页一张图的漫画 PDF 用视觉模型一页页看（抽看一部分）
+//   · 拆出书里人物的性格、说话方式、做事风格和原话，整理成人物卡
 //   · 学其中某个角色：说话做事带一点那个人的味道（人格里加一段，不是扮演，也不会变成另一个人）
 //   · 记得书里的情节和人物，别人聊起来能接上话
 //
-// 命令（只有主人能用）：/小说 帮助 里都有。
+// 命令（只有主人能用）：/小说 帮助 里都有（/漫画 也认）。
 
 import { createOps } from './ops.mjs'
 
 /** @type {import('../aurabot').AurabotModule} */
 export default {
   id: 'novel',
-  name: '看小说',
-  version: '1.1.0',
+  name: '看小说 / 漫画',
+  version: '1.2.0',
   api: 1,
-  description: '读小说（txt / docx / epub / pdf），学书里角色的性格、说话和做事方式',
+  description: '读小说和漫画（txt / docx / epub / pdf），学书里角色的性格、说话和做事方式',
 
   defaults: {
     enabled: true,
@@ -25,10 +26,13 @@ export default {
     strength: 'medium',
     chunkChars: 4500,
     maxChunks: 30,
+    comicVision: true,
+    comicPages: 6,
     autoScan: true,
     autoReadFile: true,
     notifyProgress: true,
     maxFileMB: 20,
+    downloadTimeoutSec: 480,
     extraPrompt: '',
   },
 
@@ -48,11 +52,14 @@ export default {
     },
     { key: 'chunkChars', label: '每次读多少字', type: 'number', min: 1500, max: 12000, step: 500, hint: '太长的小说会自动抽样，不是每一段都读' },
     { key: 'maxChunks', label: '每本书最多读几段', type: 'number', min: 3, max: 200, step: 1, hint: '越多人物越准，也越费模型调用；30 段约能覆盖 13 万字' },
-    { key: 'autoScan', label: '自动收书', type: 'switch', hint: '往书架文件夹里放小说（txt / docx / epub / pdf），过几分钟自动加进书架' },
-    { key: 'autoReadFile', label: '主人发小说自动读', type: 'switch', hint: '主人在 QQ 里发 txt / docx / epub / pdf 文件时，自动收下并开始读' },
+    { key: 'comicVision', label: '看漫画时真的看图', type: 'switch', hint: '用视觉模型一页页看漫画（当前 DeepSeek-V4.1-Flash 支持）；关掉就只收进书架不读' },
+    { key: 'comicPages', label: '每次看几页漫画', type: 'number', min: 2, max: 10, step: 1, hint: '一次交给模型 6 页比较好读；页数多的漫画会按「每本最多读几段」抽样' },
+    { key: 'autoScan', label: '自动收书', type: 'switch', hint: '往书架文件夹里放小说 / 漫画（txt / docx / epub / pdf），过几分钟自动加进书架' },
+    { key: 'autoReadFile', label: '主人发书自动读', type: 'switch', hint: '主人在 QQ 里发 txt / docx / epub / pdf 文件时，自动收下并开始读 / 看' },
     { key: 'notifyProgress', label: '读的时候在私聊报进度', type: 'switch' },
     { key: 'maxFileMB', label: '单本最大 MB', type: 'number', min: 1, max: 200, step: 1 },
-    { key: 'extraPrompt', label: '读小说时的额外要求', type: 'textarea', hint: '比如「重点学女性角色」「多收集口头禅」；会附在每次分析的提示词里' },
+    { key: 'downloadTimeoutSec', label: '收 QQ 文件最多等几秒', type: 'number', min: 60, max: 1800, step: 30, hint: 'QQ 的文件通道很慢（实测几十 KB/s），大文件建议直接放进书架文件夹（秒收），别走 QQ' },
+    { key: 'extraPrompt', label: '读书 / 看漫画时的额外要求', type: 'textarea', hint: '比如「重点学女性角色」「多收集口头禅」；会附在每次分析的提示词里' },
   ],
 
   setup(api) {
@@ -78,8 +85,8 @@ export default {
     // 5. 命令（只有主人能用）
     api.command({
       name: '小说',
-      aliases: ['novel', 'book'],
-      desc: '看小说、学书里角色的性格和说话方式（/小说 帮助）',
+      aliases: ['novel', 'book', '漫画', 'comic'],
+      desc: '看小说 / 漫画、学书里角色的性格和说话方式（/小说 帮助）',
       run: async (arg, msg) => {
         try {
           return await ops.command(arg, msg)
@@ -104,13 +111,13 @@ export default {
       const tools = [
         api.defineTool({
           name: 'novel_shelf',
-          description: '看她最近在读哪些小说、书架上有什么书、现在学的是书里哪个角色。聊到她在看什么书、或者别人问她在干嘛时可以用。',
+          description: '看她最近在读哪些小说 / 漫画、书架上有什么书、现在学的是书里哪个角色。聊到她在看什么书、或者别人问她在干嘛时可以用。',
           properties: {},
           execute: async () => ({ ok: true, message: ops.shelfText() }),
         }),
         api.defineTool({
           name: 'novel_recap',
-          description: '查一本小说的梗概，或者书里某个角色的性格、说话方式、做事风格和原话。别人聊起书里的情节人物、或者你想学某个角色说话时，先查这个，别编。',
+          description: '查一本小说 / 漫画的梗概，或者书里某个角色的性格、说话方式、做事风格和原话。别人聊起书里的情节人物、或者你想学某个角色说话时，先查这个，别编。',
           properties: {
             title: { type: 'string', description: '书名，不填就是她最近在读的那本' },
             character: { type: 'string', description: '角色名；填了就返回这个人的详细人物卡' },
@@ -119,7 +126,7 @@ export default {
         }),
         api.defineTool({
           name: 'novel_read',
-          description: '开始读一本已经在书架上的小说。主人说「你去看看某本书」时用。读的时候要花几分钟，读完会整理人物。',
+          description: '开始读一本已经在书架上的小说（漫画 PDF 也可以，会一页页看图）。主人说「你去看看某本书」时用。读的时候要花几分钟，读完会整理人物。',
           properties: {
             title: { type: 'string', description: '书名' },
           },
@@ -129,6 +136,19 @@ export default {
             const book = store.find(title)
             if (!book) return { ok: false, message: `书架上没有「${title}」。把小说文件发给我，或者让主人用 /小说 导入` }
             return ops.startReading(book, chat.chatId, { announce: false })
+          },
+        }),
+        api.defineTool({
+          name: 'novel_page',
+          description: '翻看漫画 / 图片 PDF 的某一页：这一页画了什么、台词是什么。别人聊到漫画的第几页、或者你想确认某段情节时用。',
+          properties: {
+            title: { type: 'string', description: '漫画名，不填就是书架上最近的一本漫画' },
+            page: { type: 'number', description: '第几页（从 1 开始）；不填就接着进度往后翻' },
+            question: { type: 'string', description: '想问这一页什么；不填就描述画面、抄台词' },
+          },
+          execute: async ({ title, page, question }) => {
+            if (!isOwnerTurn(where.sessionId, chat)) return { ok: false, message: '只有主人能让我翻漫画' }
+            return ops.lookPage(title, page, question)
           },
         }),
         api.defineTool({

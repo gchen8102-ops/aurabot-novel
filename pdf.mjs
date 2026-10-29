@@ -345,7 +345,7 @@ function paeth(a, b, c) {
   return c
 }
 
-function decodeStream(dict, data, resolve) {
+export function decodeStream(dict, data, resolve) {
   if (!data || !data.length) return data
   let filters = resolve(dict.get('Filter'))
   let parms = resolve(dict.get('DecodeParms'))
@@ -403,7 +403,11 @@ export function isPdf(buf) {
   return head.includes('%PDF-')
 }
 
-export function parsePdf(input) {
+/**
+ * 只解析结构：对象表、页树、解析函数。不给正文，给漫画 / 图片 PDF 用（要拿页面里的图片流）。
+ * 返回的 pages 顺序就是 PDF 的阅读顺序。
+ */
+export function parsePdfStructure(input) {
   const b = Buffer.isBuffer(input) ? input : Buffer.from(input || [])
   if (!isPdf(b)) throw new Error('不是 PDF 文件')
   const s = b.toString('latin1')
@@ -438,7 +442,7 @@ export function parsePdf(input) {
         if (end < 0) end = s.length
       }
       const dataEnd = end
-      stream = { data: b.subarray(start, dataEnd) }
+      stream = { data: b.subarray(start, dataEnd), start, end: dataEnd }
       const afterStream = s.indexOf('endstream', dataEnd)
       lastEnd = afterStream < 0 ? dataEnd : afterStream + 9
       after = lastEnd
@@ -557,6 +561,13 @@ export function parsePdf(input) {
     }
   }
   if (!pages.length) throw new Error('PDF 里找不到页面')
+
+  return { buf: b, objects, pages, resolve, getObj, dictOf, nameOf, numOf }
+}
+
+export function parsePdf(input) {
+  const doc = parsePdfStructure(input)
+  const { pages, resolve, dictOf, getObj } = doc
 
   // 5) 逐页抽文字
   const parts = []

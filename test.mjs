@@ -12,6 +12,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { docxToText, looksLikeZip, epubToText, pdfToText, documentText } from './text.mjs'
+import { scanComicPdf, looksLikeComic, readComicPage, encodePng } from './comic.mjs'
 import { createOps, fetchQQFile } from './ops.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -192,6 +193,38 @@ if (hasDocx) {
   ok('扫描书架跳过重复书', scan.length === 0 && ops.store.books().length === 1)
 } else {
   skip('书架文件夹收 docx', '本地没有 1.txt 样书')
+}
+
+// ---- 3.5 漫画：一页一张 JPEG 的 PDF ----
+{
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9])
+  const imageObj = `<< /Type /XObject /Subtype /Image /Width 300 /Height 400 /Filter /DCTDecode /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length ${jpeg.length} >>\nstream\n${jpeg.toString('latin1')}`
+  const comicPdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /XObject << /Im0 5 0 R >> >> >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 400] /Resources << /XObject << /Im0 5 0 R >> >> >>',
+    `${imageObj}\nendstream`,
+  ])
+  const comicPath = join(dataDir, '漫画测试.pdf')
+  writeFileSync(comicPath, comicPdf)
+  const scan = scanComicPdf(comicPdf)
+  ok('漫画：认出图片页', scan.pages === 2 && scan.entries.length === 2, `${scan.pages} 页 / ${scan.entries.length} 张图`)
+  ok('漫画：判成一页一张图', looksLikeComic(scan) === true && scan.hasFonts === false)
+
+  const rc = ops.importBuffer(readFileSync(comicPath), { name: '漫画测试_01.pdf', source: 'path', keepPath: comicPath })
+  ok('漫画：导入书架', rc.ok === true && rc.book?.format === 'comic' && rc.book?.pages === 2, rc.message)
+  const index = ops.store.indexOf(rc.book.id)
+  ok('漫画：页索引落盘', Boolean(index && index.entries?.length === 2), index ? `${index.entries.length} 页` : '没有索引')
+  ok('漫画：按路径引用原文件（不复制）', ops.store.pdfPathOf(rc.book) === comicPath && !existsSync(join(dataDir, 'books', rc.book.id + '.pdf')))
+
+  const page = ops.store.pdfPathOf(rc.book) && readComicPage(0, index, ops.store.pdfPathOf(rc.book))
+  ok('漫画：取第 1 页是 JPEG', page?.ext === 'jpg' && page.buffer[0] === 0xff && page.buffer[1] === 0xd8, page ? `${page.width}×${page.height} ${page.buffer.length}B` : '没取到')
+
+  const rc2 = ops.importBuffer(readFileSync(comicPath), { name: '漫画测试_01.pdf' })
+  ok('漫画：重复导入认出来', rc2.ok === true && rc2.duplicate === true, rc2.message)
+  const png = encodePng(2, 1, 3, Buffer.from([255, 0, 0, 0, 255, 0]))
+  ok('漫画：PNG 编码头正确', png.subarray(0, 8).toString('hex') === '89504e470d0a1a0a' && png.readUInt32BE(16) === 2)
 }
 
 // ---- 4-7. QQ 文件下载（要真网关） ----

@@ -18,7 +18,8 @@ const GENERIC_NAMES = new Set([
 
 const str = (v, n) => cut(typeof v === 'string' ? v : v == null ? '' : String(v), n)
 
-function normChar(c) {
+/** 人物卡的一条记录：读小说、看漫画共用（漫画里没有名字时用外貌称呼）。 */
+export function normalizeCharacter(c) {
   if (!c || typeof c !== 'object') return null
   const name = str(c.name, 24)
   if (!name || GENERIC_NAMES.has(name)) return null
@@ -46,7 +47,7 @@ function normChar(c) {
 function normChunk(j) {
   if (!j || typeof j !== 'object') return null
   const characters = (Array.isArray(j.characters) ? j.characters : [])
-    .map(normChar)
+    .map(normalizeCharacter)
     .filter(Boolean)
     .slice(0, 10)
   return {
@@ -145,7 +146,7 @@ function notesToItems(notes) {
 }
 
 const MERGE_PROMPT = ({ title, payload, extra }) => [
-  `你在整理小说《${title}》的「人物卡」。下面是这本书分段阅读的笔记（JSON 数组）。`,
+  `你在整理《${title}》的「人物卡」。下面是这本书分段阅读的笔记（JSON 数组）。`,
   '请把同一个人物的记录合并起来，去掉重复和矛盾，提炼出最能代表他们的性格、说话方式、做事风格。',
   '',
   '只输出这样的 JSON：',
@@ -153,6 +154,7 @@ const MERGE_PROMPT = ({ title, payload, extra }) => [
   '',
   '要求：',
   '- 按重要程度排序，最多 10 个人物',
+  '- 同一个人换了称呼、译名不同、或者一段用外貌称呼一段用本名的，按身份合并成一条（比如「男學生」和「津田隆利」是同一个人）',
   '- 不要编造笔记里没有的情节和台词',
   '- 每个人物尽量写清楚「他说话是什么味道」，让别人只看这段就能模仿',
   String(extra || '').trim() ? `- 主人的额外要求（优先满足）：${String(extra).trim()}` : '',
@@ -172,7 +174,7 @@ async function askMerge(api, title, items, extra) {
 
 function normProfile(j, notes) {
   const chars = (Array.isArray(j.characters) ? j.characters : [])
-    .map(normChar)
+    .map(normalizeCharacter)
     .filter(Boolean)
     .slice(0, 10)
   if (!chars.length) return null

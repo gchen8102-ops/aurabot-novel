@@ -29,10 +29,11 @@ export function createStore(api) {
     root,
     texts: join(root, 'books'),
     notes: join(root, 'notes'),
+    index: join(root, 'index'),
     shelf: join(root, 'shelf'),
     file: join(root, 'library.json'),
   }
-  for (const d of [paths.texts, paths.notes, paths.shelf]) mkdirSync(d, { recursive: true })
+  for (const d of [paths.texts, paths.notes, paths.index, paths.shelf]) mkdirSync(d, { recursive: true })
 
   let cache = null
   let cacheAt = 0
@@ -78,6 +79,8 @@ export function createStore(api) {
           chars: Number(b.chars) || 0,
           format: String(b.format || ''),
           pages: Number(b.pages) || 0,
+          pdfPath: String(b.pdfPath || ''),
+          pdfSize: Number(b.pdfSize) || 0,
           source: String(b.source || ''),
           sourceName: String(b.sourceName || ''),
           addedAt: Number(b.addedAt) || Date.now(),
@@ -174,7 +177,12 @@ export function createStore(api) {
     delete lib.books[id]
     if (lib.active?.bookId === id) lib.active = null
     save()
-    for (const file of [join(paths.texts, id + '.txt'), join(paths.notes, id + '.json')]) {
+    for (const file of [
+      join(paths.texts, id + '.txt'),
+      join(paths.texts, id + '.pdf'),
+      join(paths.notes, id + '.json'),
+      join(paths.index, id + '.json'),
+    ]) {
       try { rmSync(file, { force: true }) } catch (error) {}
     }
     return { title }
@@ -207,6 +215,47 @@ export function createStore(api) {
     writeFileSync(join(paths.texts, id + '.txt'), text, 'utf8')
   }
 
+  // ---- 漫画：原 PDF + 页索引 ----
+  // 从书架文件夹 / 本地路径进来的书只记原路径，不复制 70MB 的大文件；
+  // 从 QQ / 网址收的没有稳定路径，才复制到 books/<id>.pdf。
+
+  function pdfPathOf(book) {
+    if (!book) return ''
+    if (book.pdfPath) return book.pdfPath
+    const local = join(paths.texts, book.id + '.pdf')
+    return existsSync(local) ? local : ''
+  }
+
+  function savePdf(id, buf) {
+    const file = join(paths.texts, id + '.pdf')
+    writeFileSync(file, buf)
+    return file
+  }
+
+  function indexPath(id) {
+    return join(paths.index, id + '.json')
+  }
+
+  function indexOf(id) {
+    try {
+      const j = JSON.parse(readFileSync(indexPath(id), 'utf8'))
+      return j && typeof j === 'object' ? j : null
+    } catch (error) {
+      return null
+    }
+  }
+
+  function saveIndex(id, data) {
+    const file = indexPath(id)
+    const tmp = file + '.tmp'
+    try {
+      writeFileSync(tmp, JSON.stringify(data), 'utf8')
+      renameSync(tmp, file)
+    } catch (error) {
+      try { writeFileSync(file, JSON.stringify(data), 'utf8') } catch (e) {}
+    }
+  }
+
   function notesOf(id) {
     try {
       const j = JSON.parse(readFileSync(join(paths.notes, id + '.json'), 'utf8'))
@@ -233,7 +282,7 @@ export function createStore(api) {
     const base = 'b-' + requireSlug(title)
     let id = base
     let n = 2
-    while (existsSync(join(paths.texts, id + '.txt')) || byId(id)) id = `${base}-${n++}`
+    while (existsSync(join(paths.texts, id + '.txt')) || existsSync(join(paths.texts, id + '.pdf')) || byId(id)) id = `${base}-${n++}`
     return id
   }
 
@@ -273,6 +322,10 @@ export function createStore(api) {
     setActive,
     textOf,
     saveText,
+    pdfPathOf,
+    savePdf,
+    indexOf,
+    saveIndex,
     notesOf,
     saveNotes,
     newId,

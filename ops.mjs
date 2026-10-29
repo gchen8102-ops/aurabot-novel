@@ -2,14 +2,19 @@
 // index.mjs 只负责把它接到插件上。
 
 import { existsSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
 
 import { createStore, normKey } from './store.mjs'
 import {
   documentText, cleanText, splitChunks, pickIndices,
   titleFromFilename, titleFromUrl, cut, charsLabel,
 } from './text.mjs'
-import { analyzeChunk, synthesize, mergeLocal } from './learn.mjs'
+import { isPdf } from './pdf.mjs'
+import {
+  scanComicPdf, looksLikeComic, readComicPage, readComicRoster, analyzeComicPages,
+} from './comic.mjs'
+import { analyzeChunk, synthesize, mergeLocal, withTimeout } from './learn.mjs'
 import {
   personaBlock, contextLine, ruleLine, characterCard, normalizeStrength,
 } from './style.mjs'
@@ -20,23 +25,63 @@ const clampNum = (v, min, max, fallback) => {
   return Math.min(max, Math.max(min, n))
 }
 
-/** 从 QQ 文件消息里把文件下下来。消息段一般自带直链；没有就问网关要（私聊 / 群文件接口不一样）。 */
-export async function fetchQQFile(api, msg, data) {
+const FILE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+const mbLabel = (n) => `${(Number(n || 0) / 1048576).toFixed(1)}MB`
+
+/**
+ * 从 QQ 文件消息里把文件下下来。消息段一般自带直链；没有就问网关要（私聊 / 群文件接口不一样）。
+ *
+ * 两个坑（2026-10-29 实测，73MB 的 PDF）：
+ *  1) 直链是 QQ 的离线文件通道，不带 Range 时服务器要准备好整个文件才回头，25 秒都拿不到响应头；
+ *     带上 `Range: bytes=0-` 立刻 206，所以下载一律带 Range。
+ *  2) 通道本身很慢（约 60KB/s），70MB 要下 20 分钟，旧的 60 秒超时必然失败。
+ *     这里改成流式下载：总预算可配（默认 8 分钟）、按「单本最大 MB」边下边截断、超时能说清楚下到哪了。
+ */
+export async function fetchQQFile(api, msg, data, { maxBytes = 0, timeoutMs = 8 * 60_000, onProgress } = {}) {
   const fileId = data.file_id || data.id || data.file_uuid || data.file
+  const fileHash = String(data.file_hash || data.fileHash || '')
+  const sizeHint = Number(data.file_size || data.size || 0)
   const problems = []
+  const budget = Math.max(20_000, Number(timeoutMs) || 0)
+  const deadline = Date.now() + budget
+  const tooBig = (n) => {
+    const e = new Error(`文件 ${mbLabel(n)}，超过单本上限 ${Math.round(maxBytes / 1048576)}MB`)
+    e.code = 'TOO_BIG'
+    return e
+  }
+  // 段里就写着大小：超过上限就别下了，省得等半天再被拒
+  if (maxBytes && sizeHint > maxBytes) throw tooBig(sizeHint)
 
   async function download(url) {
+    const left = deadline - Date.now()
+    if (left <= 1500) { problems.push('下载超时'); return null }
+    const ctrl = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort() }, left)
     try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(60000) })
-      if (!res.ok) {
-        problems.push('HTTP ' + res.status)
-        return null
+      const res = await fetch(url, {
+        signal: ctrl.signal,
+        headers: { range: 'bytes=0-', 'user-agent': FILE_UA, accept: '*/*' },
+      })
+      if (!res.ok) { problems.push(`HTTP ${res.status}`); return null }
+      if (!res.body) return null
+      const total = Number(res.headers.get('content-length') || 0) || sizeHint
+      if (maxBytes && total > maxBytes) throw tooBig(total)
+      const chunks = []
+      let done = 0
+      for await (const part of res.body) {
+        done += part.length
+        if (maxBytes && done > maxBytes) throw tooBig(done)
+        chunks.push(Buffer.from(part))
+        try { onProgress?.(done, total) } catch (error) {}
       }
-      const buf = Buffer.from(await res.arrayBuffer())
-      return buf.length ? buf : null
+      return done ? Buffer.concat(chunks) : null
     } catch (error) {
-      problems.push(error.message)
+      if (error?.code === 'TOO_BIG') throw error
+      problems.push(timedOut ? `下载超时（${Math.round(budget / 1000)} 秒，通道慢）` : (error?.message || String(error)))
       return null
+    } finally {
+      clearTimeout(timer)
     }
   }
 
@@ -47,18 +92,26 @@ export async function fetchQQFile(api, msg, data) {
     if (buf) return buf
   }
 
-  // 2) 问网关要地址：私聊用 get_private_file_url，群文件用 get_group_file_url
+  // 2) 问网关要地址：私聊用 get_private_file_url（file_hash 要原样带上），群文件用 get_group_file_url
   const attempts = []
   if (msg.kind === 'group') {
-    attempts.push(['get_group_file_url', { group_id: Number(msg.groupId), file_id: fileId, busid: Number(data.busid || 0) }])
+    attempts.push(['get_group_file_url', {
+      group_id: Number(msg.groupId),
+      file_id: fileId,
+      busid: Number(data.busid || data.bus_id || 0),
+    }])
   } else {
-    attempts.push(['get_private_file_url', { file_id: fileId }])
+    attempts.push(['get_private_file_url', {
+      user_id: Number(msg.userId) || undefined,
+      file_id: fileId,
+      file_hash: fileHash,
+    }])
   }
   // 3) 最后才是老接口 get_file —— 它只认图片 / 语音缓存，普通文件都会报 file_id not found
   attempts.push(['get_file', { file_id: fileId }])
 
   for (const [action, params] of attempts) {
-    if (!params.file_id) continue
+    if (!params.file_id && !params.file_hash) continue
     try {
       const r = await api.onebot(action, params, { timeoutMs: 20000 })
       if (r && r.retcode && r.retcode !== 0) {
@@ -79,6 +132,7 @@ export async function fetchQQFile(api, msg, data) {
         if (existsSync(local)) return readFileSync(local)
       }
     } catch (error) {
+      if (error?.code === 'TOO_BIG') throw error
       problems.push(action + '：' + error.message)
     }
   }
@@ -96,6 +150,7 @@ export function createOps({ api, store = createStore(api) }) {
   const enabled = () => settings().enabled !== false
   const strength = () => normalizeStrength(settings().strength)
   const maxBytes = () => clampNum(settings().maxFileMB, 1, 200, 20) * 1024 * 1024
+  const downloadBudgetMs = () => clampNum(settings().downloadTimeoutSec, 60, 1800, 480) * 1000
 
   // 上一次模块重新加载时可能正读到一半：没有进行中的任务，就标成「读了一半」，别一直显示在读
   try {
@@ -129,7 +184,7 @@ export function createOps({ api, store = createStore(api) }) {
   function contextText() {
     const s = activeStyle()
     if (s) return contextLine({ bookTitle: s.book.title, character: s.character })
-    if (reading) return `（你正在读《${reading.title}》，还没读完；别人问起可以聊两句，但别编后面的情节。）`
+    if (reading) return `（你正在${reading.kind === 'comic' ? '看漫画' : '读书'}《${reading.title}》，还没${reading.kind === 'comic' ? '看完' : '读完'}；别人问起可以聊两句，但别编后面的情节。）`
     return ''
   }
 
@@ -142,7 +197,7 @@ export function createOps({ api, store = createStore(api) }) {
 
   // ---------- 导入 ----------
 
-  function importBuffer(buf, { name = '', title = '', source = '' } = {}) {
+  function importBuffer(buf, { name = '', title = '', source = '', keepPath = '' } = {}) {
     if (!buf || !buf.length) return { ok: false, message: '这个文件是空的' }
     const limit = maxBytes()
     if (buf.length > limit) {
@@ -151,6 +206,11 @@ export function createOps({ api, store = createStore(api) }) {
     // 正文可能是 txt / docx / epub / pdf：按格式自动拆
     const parsed = documentText(buf, name)
     let text = cleanText(parsed.text || '')
+    // 没有文字层、一页一张图的 PDF（漫画 / 扫描书）：不当坏文件，收成漫画，让她一页页看
+    if (text.length < 200 && isPdf(buf)) {
+      const comic = tryImportComic(buf, { name, title, source, keepPath })
+      if (comic) return comic
+    }
     if (text.length < 200) {
       if (parsed.error) return { ok: false, message: parsed.error }
       const hint = parsed.kind === 'pdf' || parsed.kind === 'epub'
@@ -194,13 +254,81 @@ export function createOps({ api, store = createStore(api) }) {
     return { ok: true, book, message: `《${book.title}》（${formatLabel(book)}${charsLabel(text.length)}）已经放到书架上了` }
   }
 
+  /** 图片 PDF 才收成漫画；普通文字 PDF 返回 null，让原来的流程报错。 */
+  function tryImportComic(buf, { name, title, source, keepPath }) {
+    let scan
+    try {
+      scan = scanComicPdf(buf)
+    } catch (error) {
+      return null
+    }
+    if (!looksLikeComic(scan)) return null
+    const hash = createHash('sha1').update(buf).digest('hex')
+    const dup = store.books().find((b) => b.hash === hash)
+    if (dup) return { ok: true, duplicate: true, book: dup, message: `《${dup.title}》已经在书架上了` }
+
+    let bookTitle = String(title || '').trim() || titleFromFilename(name) || '未命名漫画'
+    const id = store.newId(bookTitle)
+    // 路径 / 书架进来的只记原文件，不复制 70MB；QQ / 网址收的没有稳定路径，复制一份
+    const pdfPath = keepPath || ''
+    if (!pdfPath) store.savePdf(id, buf)
+    store.saveIndex(id, {
+      version: 1,
+      pages: scan.pages,
+      entries: scan.entries,
+      hasFonts: scan.hasFonts,
+      size: buf.length,
+      at: Date.now(),
+    })
+    const now = Date.now()
+    const book = {
+      id,
+      title: bookTitle.slice(0, 80),
+      hash,
+      chars: 0,
+      format: 'comic',
+      pages: scan.pages,
+      pdfPath,
+      pdfSize: buf.length,
+      source,
+      sourceName: name || '',
+      addedAt: now,
+      updatedAt: now,
+      status: 'new',
+      error: '',
+      progress: { done: 0, total: scan.pages, sampled: false },
+      profile: null,
+    }
+    store.addBook(book)
+    log.info(`收到漫画：《${book.title}》${scan.pages} 页${scan.hasFonts ? '（带文字层）' : ''}`)
+    const skipped = scan.skipped?.length ? `，有 ${scan.skipped.length} 页图片格式不认` : ''
+    return {
+      ok: true,
+      book,
+      message: `《${book.title}》（漫画 PDF · ${scan.pages} 页）已经放到书架上了${skipped}`,
+    }
+  }
+
   /** 「PDF · 12 页」这种格式标签，给书架和提示语用。 */
   function formatLabel(book) {
     const kind = String(book?.format || '').toLowerCase()
     const pages = Number(book?.pages) || 0
+    if (kind === 'comic') return `漫画 · ${pages ? `${pages} 页` : '图片 PDF'} · `
     if (kind === 'pdf') return `PDF${pages ? ` · ${pages} 页` : ''} · `
     if (kind === 'epub') return 'EPUB · '
     if (kind === 'docx') return 'DOCX · '
+    return ''
+  }
+
+  const isComic = (book) => String(book?.format || '').toLowerCase() === 'comic'
+
+  /** 书架列表前面的小标签。 */
+  function formatTag(book) {
+    const kind = String(book?.format || '').toLowerCase()
+    if (kind === 'comic') return '[漫画] '
+    if (kind === 'pdf') return '[PDF] '
+    if (kind === 'epub') return '[EPUB] '
+    if (kind === 'docx') return '[DOCX] '
     return ''
   }
 
@@ -227,7 +355,7 @@ export function createOps({ api, store = createStore(api) }) {
     if (!st.isFile()) return { ok: false, message: '这个路径不是文件' }
     if (st.size > maxBytes()) return { ok: false, message: `文件太大（${(st.size / 1048576).toFixed(1)}MB），上限 ${Math.round(maxBytes() / 1048576)}MB` }
     try {
-      return importBuffer(readFileSync(full), { name: full.split(/[\\/]/).pop(), source: 'path' })
+      return importBuffer(readFileSync(full), { name: full.split(/[\\/]/).pop(), source: 'path', keepPath: resolve(full) })
     } catch (error) {
       return { ok: false, message: `读取失败：${error.message}` }
     }
@@ -272,11 +400,13 @@ export function createOps({ api, store = createStore(api) }) {
       if (scanned.get(f.name) === key) continue
       if (f.size > maxBytes()) {
         scanned.set(f.name, key)
-        results.push({ ok: false, message: `《${f.name}》太大，跳过了` })
+        const line = `《${f.name}》有 ${mbLabel(f.size)}，超过单本上限 ${Math.round(maxBytes() / 1048576)}MB，没放进书架（面板里可调「单本最大 MB」）`
+        log.warn(line)
+        results.push({ ok: false, message: line })
         continue
       }
       try {
-        const r = importBuffer(readFileSync(f.path), { name: f.name, source: 'shelf' })
+        const r = importBuffer(readFileSync(f.path), { name: f.name, source: 'shelf', keepPath: f.path })
         scanned.set(f.name, key)
         if (!r.duplicate) results.push(r)
       } catch (error) {
@@ -292,8 +422,9 @@ export function createOps({ api, store = createStore(api) }) {
   function startReading(book, chatId, { announce = true } = {}) {
     if (!book) return { ok: false, message: '书架里没有这本书' }
     if (reading) return { ok: false, message: `我正在读《${reading.title}》，等这本读完再读下一本` }
+    if (isComic(book)) return startComicReading(book, chatId, { announce })
     if (!store.textOf(book)) return { ok: false, message: `《${book.title}》的正文不见了，重新导入一次吧` }
-    const job = { bookId: book.id, title: book.title, chatId, cancel: false, startedAt: Date.now() }
+    const job = { bookId: book.id, title: book.title, chatId, cancel: false, startedAt: Date.now(), kind: 'text' }
     reading = job
     readLoop(job)
       .catch((error) => {
@@ -438,9 +569,295 @@ export function createOps({ api, store = createStore(api) }) {
   }
 
   function stopReading() {
-    if (!reading) return '现在没在读书'
+    if (!reading) return '现在没在读书 / 看漫画'
     reading.cancel = true
     return `好，先不读《${reading.title}》了（下次发 /小说 读 ${reading.title} 接着读）`
+  }
+
+  // ---------- 看漫画 ----------
+  //
+  // 漫画 PDF 没有文字层，只能一页页交给视觉模型看。为了不把 156 页全烧一遍：
+  //   · 每「段」几页（设置「每次看几页」，默认 6），长书按 /小说 的「每本最多读几段」均匀抽样；
+  //   · 先看开头几页认一份人物名册，后面每段都带着，避免同一人每段换名字、最后合并不起来；
+  //   · 看完用和读小说同一套 synthesize 整理人物卡，所以 /小说 角色 / 学 / 卡 全都照旧能用。
+
+  function visionState() {
+    if (settings().comicVision === false) return false
+    try {
+      const lib = api.lib && api.lib('core/llm.js')
+      if (!lib || typeof lib.canSeeImages !== 'function') return null
+      return lib.canSeeImages(api.dsh, api.config ? api.config() : null)
+    } catch (error) {
+      return null
+    }
+  }
+
+  async function assertCanSee() {
+    const see = await visionState()
+    if (see === false) {
+      throw new Error('当前模型看不了图：面板「模型」里换一个支持视觉的，或者把「视觉能力」设成 on')
+    }
+  }
+
+  /** 页索引没了 / 原 PDF 换过了，就重扫一遍（只记位置，很便宜）。 */
+  function ensureComicIndex(book, pdfPath) {
+    let index = store.indexOf(book.id)
+    let size = 0
+    try { size = statSync(pdfPath).size } catch (error) {}
+    const ok = index && Array.isArray(index.entries) && index.entries.length && (!size || index.size === size)
+    if (ok) return index
+    const scan = scanComicPdf(readFileSync(pdfPath))
+    index = {
+      version: 1,
+      pages: scan.pages,
+      entries: scan.entries,
+      hasFonts: scan.hasFonts,
+      size,
+      at: Date.now(),
+    }
+    store.saveIndex(book.id, index)
+    if (book.pages !== scan.pages) store.updateBook(book.id, { pages: scan.pages })
+    return index
+  }
+
+  /** 读一段页的图片；一次请求别塞太大（6 页 1279×1920 的 JPEG 大约 2~3MB）。 */
+  function loadPageImages(pdfPath, index, from, to, budget = 5.5 * 1024 * 1024) {
+    const images = []
+    let bytes = 0
+    for (let p = from; p <= to; p++) {
+      let img
+      try {
+        img = readComicPage(p - 1, index, pdfPath)
+      } catch (error) {
+        log.warn(`第 ${p} 页读不出来：${error.message}`)
+        continue
+      }
+      if (images.length && bytes + img.buffer.length > budget) break
+      images.push({ ...img, page: p })
+      bytes += img.buffer.length
+    }
+    return images
+  }
+
+  function comicWindows(pages, pageSize) {
+    const out = []
+    for (let p = 1; p <= pages; p += pageSize) out.push([p, Math.min(pages, p + pageSize - 1)])
+    return out
+  }
+
+  function startComicReading(book, chatId, { announce = true } = {}) {
+    const pdfPath = store.pdfPathOf(book)
+    if (!pdfPath || !existsSync(pdfPath)) {
+      return { ok: false, message: `《${book.title}》的 PDF 原文件找不到了（可能被移动 / 删了），重新导入一次吧` }
+    }
+    const job = { bookId: book.id, title: book.title, chatId, cancel: false, startedAt: Date.now(), kind: 'comic' }
+    reading = job
+    readComicLoop(job)
+      .catch((error) => {
+        log.error(`看漫画《${job.title}》出错：`, error.message)
+        const cur = store.byId(job.bookId)
+        if (cur && cur.status !== 'done') store.updateBook(job.bookId, { status: 'error', error: cut(error.message, 200) })
+        if (job.chatId) send(job.chatId, `《${job.title}》没看完：${cut(error.message, 140)}\n下次发 /小说 读 ${job.title} 可以接着看`)
+      })
+      .finally(() => {
+        if (reading === job) reading = null
+      })
+    const pages = Number(book.pages) || 0
+    const note = book.status === 'done' ? '（再看一遍，更新人物卡）' : book.progress?.done ? '（接着上次看）' : ''
+    return {
+      ok: true,
+      message: announce
+        ? `好，我去看《${book.title}》${note}（${pages} 页）。漫画没有文字层，得一页页看图，会慢一点，看完告诉你～`
+        : '好，我去看了',
+    }
+  }
+
+  async function readComicLoop(job) {
+    const book = store.byId(job.bookId)
+    if (!book) return
+    const pdfPath = store.pdfPathOf(book)
+    if (!pdfPath || !existsSync(pdfPath)) throw new Error('漫画的 PDF 原文件找不到了，重新导入一次吧')
+    await assertCanSee()
+
+    const index = ensureComicIndex(book, pdfPath)
+    if (!index.entries.length) throw new Error('这本 PDF 里没有能看的页面图')
+
+    const pageSize = clampNum(settings().comicPages, 2, 10, 6)
+    const maxChunks = clampNum(settings().maxChunks, 3, 200, 30)
+    const windows = comicWindows(index.pages, pageSize)
+    const targets = pickIndices(windows.length, maxChunks)
+    const sampled = targets.length < windows.length
+
+    let notes = store.notesOf(book.id)
+    if (!notes || notes.kind !== 'comic' || notes.pageSize !== pageSize || notes.total !== windows.length || notes.pages !== index.pages) {
+      notes = {
+        version: 2,
+        kind: 'comic',
+        pageSize,
+        total: windows.length,
+        pages: index.pages,
+        chunks: {},
+        roster: null,
+        at: Date.now(),
+      }
+    }
+
+    const pagesOf = (note) => (note && note.ok ? Math.max(0, Number(note.to) - Number(note.from) + 1) : 0)
+    let done = targets.reduce((sum, i) => sum + pagesOf(notes.chunks[i]), 0)
+    book.status = 'reading'
+    book.error = ''
+    book.progress = { done, total: index.pages, sampled }
+    store.updateBook(book.id, { status: 'reading', error: '', progress: book.progress })
+    log.info(`开始看《${book.title}》：${index.pages} 页，每段 ${pageSize} 页，${windows.length} 段里看 ${targets.length} 段${sampled ? '（抽样）' : ''}`)
+
+    // 认人：只做一次，失败也不影响后面看图
+    if (!notes.roster) {
+      const first = loadPageImages(pdfPath, index, 1, Math.min(3, index.pages))
+      if (first.length) {
+        try {
+          notes.roster = await readComicRoster(api, { title: book.title, images: first })
+          store.saveNotes(book.id, notes)
+          if (notes.roster?.length) log.info(`《${book.title}》认出 ${notes.roster.length} 个人物：${notes.roster.map((c) => c.name).join('、')}`)
+        } catch (error) {
+          log.warn(`《${book.title}》认人物失败，先不带名册继续：${error.message}`)
+        }
+      }
+    }
+
+    let failed = 0
+    let lastNotify = 0
+    const reportInChat = job.chatId && String(job.chatId).startsWith('private:') && settings().notifyProgress !== false
+
+    for (const wi of targets) {
+      if (disposed || job.cancel) {
+        book.status = 'paused'
+        book.progress = { done, total: index.pages, sampled }
+        store.updateBook(book.id, { status: 'paused', progress: book.progress })
+        log.info(`《${book.title}》停在第 ${windows[wi][0]} 页`)
+        return { paused: true }
+      }
+      if (notes.chunks[wi]?.ok) continue
+      const images = loadPageImages(pdfPath, index, windows[wi][0], windows[wi][1])
+      if (!images.length) {
+        failed++
+        log.warn(`《${book.title}》第 ${windows[wi][0]}-${windows[wi][1]} 页一张图都没读出来，跳过`)
+        continue
+      }
+      const from = images[0].page
+      const to = images[images.length - 1].page
+      try {
+        const note = await analyzeComicPages(api, {
+          title: book.title,
+          from,
+          to,
+          images,
+          roster: notes.roster,
+          strength: strength(),
+          extra: settings().extraPrompt,
+        })
+        if (disposed || job.cancel) return { paused: true }
+        if (note) {
+          notes.chunks[wi] = note
+          done += pagesOf(note)
+        } else {
+          failed++
+          log.warn(`《${book.title}》第 ${from}-${to} 页没看成（模型没按 JSON 回），跳过`)
+        }
+      } catch (error) {
+        failed++
+        log.warn(`《${book.title}》第 ${from}-${to} 页看失败：${error.message}`)
+      }
+      store.saveNotes(book.id, notes)
+      book.progress = { done, total: index.pages, sampled }
+      store.updateBook(book.id, { progress: book.progress })
+
+      if (reportInChat && targets.length >= 4 && done / index.pages >= 0.5 && !lastNotify) {
+        lastNotify = 1
+        send(job.chatId, `《${book.title}》看了一半了（${done}/${index.pages} 页），等我一会儿～`)
+      }
+    }
+
+    if (disposed || job.cancel) {
+      book.status = 'paused'
+      store.updateBook(book.id, { status: 'paused', progress: { done, total: index.pages, sampled } })
+      return { paused: true }
+    }
+
+    const okNotes = targets.map((i) => notes.chunks[i]).filter((n) => n && n.ok)
+    if (!okNotes.length) throw new Error(`一页都没看成（${failed} 段失败），可能是模型看图失败，看看插件日志`)
+
+    const profile = await synthesize(api, {
+      title: book.title,
+      notes: okNotes,
+      strength: strength(),
+      extra: settings().extraPrompt,
+    }) || mergeLocal(okNotes)
+    if (!profile?.characters?.length) throw new Error('看完了，但没整理出人物卡')
+
+    book.status = 'done'
+    book.error = ''
+    book.progress = { done: Math.min(index.pages, done), total: index.pages, sampled }
+    book.profile = { ...profile, kind: 'comic', chunksRead: okNotes.length, sampled, at: Date.now() }
+    store.updateBook(book.id, { status: 'done', error: '', progress: book.progress, profile: book.profile })
+    log.info(`《${book.title}》看完了，整理出 ${profile.characters.length} 个人物`)
+
+    let auto = ''
+    if (settings().autoLearn !== false && !store.active() && profile.characters[0]?.name) {
+      const c = profile.characters[0]
+      store.setActive({ bookId: book.id, name: c.name })
+      auto = `我先把${c.name}学上了`
+    }
+    const names = profile.characters.slice(0, 6).map((c) => c.name + (c.role ? `（${cut(c.role, 12)}）` : '')).join('、')
+    const hint = !auto && profile.characters.length
+      ? (store.active() ? '想换成漫画里别的人，发 /小说 学 名字' : '想让我学谁，发 /小说 学 名字')
+      : ''
+    const lines = [
+      `《${book.title}》看完啦${sampled ? `（${index.pages} 页里抽看了 ${book.progress.done} 页）` : `（${index.pages} 页）`}。`,
+      `漫画里的人：${names}`,
+      auto ? `${auto}，接下来说话会带一点${profile.characters[0].name}的味道～` : '',
+      hint,
+      failed ? `（有 ${failed} 段没看成，跳过了）` : '',
+    ].filter(Boolean)
+    if (job.chatId) send(job.chatId, lines.join('\n'))
+    return { ok: true }
+  }
+
+  /** 给她翻一页看看：聊天里说「漫画第 5 页写了什么」时用。 */
+  async function lookPage(titleQuery, page, question) {
+    const book = titleQuery ? store.find(titleQuery) : store.books().find(isComic)
+    if (!book) return { ok: false, message: '书架上还没有漫画' }
+    if (!isComic(book)) return { ok: false, message: `《${book.title}》不是漫画 PDF` }
+    const pdfPath = store.pdfPathOf(book)
+    if (!pdfPath || !existsSync(pdfPath)) return { ok: false, message: `《${book.title}》的 PDF 原文件找不到了，重新导入一次吧` }
+    try {
+      await assertCanSee()
+    } catch (error) {
+      return { ok: false, message: error.message }
+    }
+    const index = ensureComicIndex(book, pdfPath)
+    let n = Math.round(Number(page))
+    if (!Number.isFinite(n) || n < 1) n = Math.min(index.pages, (Number(book.progress?.done) || 0) + 1)
+    n = Math.max(1, Math.min(index.pages, n))
+    let img
+    try {
+      img = readComicPage(n - 1, index, pdfPath)
+    } catch (error) {
+      return { ok: false, message: `第 ${n} 页看不了：${error.message}` }
+    }
+    const ask = String(question || '').trim()
+      || '这一页画了什么？把画面上的台词按顺序抄下来（繁体就写繁体），再说这一页在讲什么。'
+    try {
+      const text = await withTimeout(api.ask({
+        system: '你在看一页漫画，用中文回答，不要客套。',
+        text: `这是漫画《${book.title}》第 ${n} 页（共 ${index.pages} 页，中文版日本漫画，阅读顺序从右往左、从上往下）。${ask}`,
+        images: [{ data: img.buffer.toString('base64'), mediaType: img.mime }],
+        maxTokens: 2000,
+        reasoningEffort: 'off',
+      }), 180000, '看漫画这一页')
+      return { ok: true, page: n, pages: index.pages, message: `《${book.title}》第 ${n} 页：${cut(text, 1200)}` }
+    } catch (error) {
+      return { ok: false, message: `第 ${n} 页没看成：${cut(error.message, 160)}` }
+    }
   }
 
   // ---------- 学角色 ----------
@@ -527,6 +944,12 @@ export function createOps({ api, store = createStore(api) }) {
     error: '读失败了',
   }
 
+  /** 漫画用「看」：还没看 / 在看 / 看了一半 / 看完了 / 看失败了。 */
+  function statusLabel(book, status) {
+    if (!isComic(book)) return STATUS_LABEL[status] || status
+    return { new: '还没看', reading: '在看', paused: '看了一半', done: '看完了', error: '看失败了' }[status] || status
+  }
+
   function shelfText({ withPath = false } = {}) {
     const list = store.books()
     const a = store.active()
@@ -541,8 +964,8 @@ export function createOps({ api, store = createStore(api) }) {
     for (const b of list.slice(0, 12)) {
       const p = b.progress || {}
       const pct = b.status === 'done' ? '' : p.total ? ` ${Math.round((p.done / p.total) * 100)}%` : ''
-      const tag = b.format && b.format !== 'txt' ? `[${String(b.format).toUpperCase()}] ` : ''
-      lines.push(`· ${tag}《${b.title}》${STATUS_LABEL[b.status] || b.status}${pct}`)
+      const tag = formatTag(b)
+      lines.push(`· ${tag}《${b.title}》${statusLabel(b, b.status)}${pct}`)
     }
     if (list.length > 12) lines.push(`……还有 ${list.length - 12} 本`)
     if (withPath) lines.push(`放新书：${store.paths.shelf}`)
@@ -571,7 +994,8 @@ export function createOps({ api, store = createStore(api) }) {
     return [
       '「看小说」怎么用：',
       `· 把 txt / docx / epub / pdf 放到 ${store.paths.shelf}，几秒后自动进书架；也可以直接发我文件，或发 /小说 导入 <路径/网址>`,
-      '· /小说 书架 — 有哪些书、读到哪了',
+      '· 漫画 PDF（一页一张图、没有文字层的那种）也能收：我会一页页看图，抽看一部分，拆人物、学角色',
+      '· /小说 书架 — 有哪些书、读到哪了（刚往文件夹里放了新书就发 /小说 刷新）',
       '· /小说 读 书名 — 我去读，读完能学里面的人',
       '· /小说 角色 — 我现在学到了哪些人物',
       '· /小说 学 名字 — 学他的性格、说话、做事方式',
@@ -590,7 +1014,7 @@ export function createOps({ api, store = createStore(api) }) {
     for (const book of list.slice(0, 8)) {
       const chars = book.profile?.characters || []
       if (!chars.length) {
-        lines.push(`《${book.title}》：${STATUS_LABEL[book.status] || '还没读'}，读完了才知道有哪些人`)
+        lines.push(`《${book.title}》：${statusLabel(book, book.status)}，读完 / 看完才知道有哪些人`)
         continue
       }
       lines.push(`《${book.title}》：${chars.map((c) => c.name + (c.role ? `（${cut(c.role, 10)}）` : '')).join('、')}`)
@@ -622,7 +1046,12 @@ export function createOps({ api, store = createStore(api) }) {
       let detail = ''
       if (b.status === 'done') detail = p.sampled ? `（${p.total} 段里抽读 ${p.done} 段）` : p.total ? `（${p.total} 段）` : ''
       else if (p.total) detail = ` ${p.done}/${p.total} 段（${pct}%）`
-      lines.push(`《${b.title}》${STATUS_LABEL[b.status] || b.status}${detail}${b.error ? `：${cut(b.error, 60)}` : ''}`)
+      if (isComic(b)) {
+        detail = b.status === 'done'
+          ? `（${p.total} 页${p.sampled ? `，抽看 ${Math.min(p.done, p.total)} 页` : ''}）`
+          : p.total ? ` ${Math.min(p.done, p.total)}/${p.total} 页（${pct}%）` : ''
+      }
+      lines.push(`《${b.title}》${statusLabel(b, b.status)}${detail}${b.error ? `：${cut(b.error, 60)}` : ''}`)
     }
     return lines.join('\n')
   }
@@ -649,7 +1078,7 @@ export function createOps({ api, store = createStore(api) }) {
     }
     const p = book.profile
     const out = [
-      `《${book.title}》`,
+      `《${book.title}》${isComic(book) ? `（漫画 · ${book.pages} 页）` : ''}`,
       p.summary ? `梗概：${cut(p.summary, 500)}` : '',
       p.tone ? `文风：${cut(p.tone, 80)}` : '',
       `人物：${p.characters.map((c) => c.name + (c.role ? `（${cut(c.role, 16)}）` : '')).join('、')}`,
@@ -662,6 +1091,7 @@ export function createOps({ api, store = createStore(api) }) {
 
   const SUB_ALIASES = {
     书架: 'shelf', 书: 'shelf', 列表: 'shelf', 书单: 'shelf', shelf: 'shelf', list: 'shelf',
+    刷新: 'shelf', 扫描: 'shelf', 收书: 'shelf', refresh: 'shelf', scan: 'shelf',
     读: 'read', 看: 'read', 开读: 'read', 读书: 'read', read: 'read',
     导入: 'import', 加: 'import', 收: 'import', 下载: 'import', import: 'import',
     学: 'learn', 模仿: 'learn', 扮演: 'learn', 学会: 'learn', learn: 'learn',
@@ -775,9 +1205,33 @@ export function createOps({ api, store = createStore(api) }) {
       await send(msg.chatId, `这个文件（${name}）我只会看 txt / docx / epub / pdf 小说，别的格式认不出来`)
       return true
     }
-    await send(msg.chatId, `收到「${name}」，我先把书收下…`)
+    // 文件大小消息段里就有：超上限就别下，直接告诉她怎么办（别等两分钟再报超时）
+    const sizeHint = Number(data.file_size || data.size || 0)
+    if (sizeHint > maxBytes()) {
+      // QQ 的离线文件通道实测约 60KB/s，按这个估个大概时间
+      const mins = Math.round(sizeHint / (60 * 1024) / 60)
+      await send(msg.chatId, [
+        `「${name}」有 ${mbLabel(sizeHint)}，超过单本上限 ${Math.round(maxBytes() / 1048576)}MB。`,
+        `· 想让我读：面板里把「单本最大 MB」调到 ${Math.ceil(sizeHint / 1048576)} 以上（QQ 文件通道只有几十 KB/s${mins >= 2 ? `，这个大小大概要下 ${mins} 分钟，容易超时` : ''}）`,
+        `· 更快：直接把文件拷到 ${store.paths.shelf}（也受这个上限限制），我 5 分钟内自己收；急的话发 /小说 刷新`,
+      ].join('\n'))
+      return true
+    }
+    await send(msg.chatId, `收到「${name}」${sizeHint ? `（${mbLabel(sizeHint)}）` : ''}，我先把书收下…`)
     try {
-      const buf = await fetchQQFile(api, msg, data)
+      let lastNote = 0
+      const onProgress = settings().notifyProgress === false ? null : (done, total) => {
+        if (!total || done >= total) return
+        const now = Date.now()
+        if (now - lastNote < 60_000) return
+        lastNote = now
+        send(msg.chatId, `还在下「${name}」：${mbLabel(done)} / ${mbLabel(total)}…`)
+      }
+      const buf = await fetchQQFile(api, msg, data, {
+        maxBytes: maxBytes(),
+        timeoutMs: downloadBudgetMs(),
+        onProgress,
+      })
       const r = importBuffer(buf, { name, source: 'qq' })
       if (!r.ok) {
         await send(msg.chatId, r.message)
@@ -793,7 +1247,18 @@ export function createOps({ api, store = createStore(api) }) {
       const started = startReading(r.book, msg.chatId)
       await send(msg.chatId, `${r.message}\n${started.message}`)
     } catch (error) {
-      await send(msg.chatId, `文件没拿到：${error.message}\n也可以把 txt / epub / pdf 放到 ${store.paths.shelf}`)
+      // 原始错误（网关 / HTTP / 超时）只写日志，聊天里说人话——以前会把 OneBot 的报错整段倒给她
+      log.warn(`收 QQ 文件失败（${name}）：${error?.message || error}`)
+      const raw = String(error?.message || error)
+      const shelf = store.paths.shelf
+      if (error?.code === 'TOO_BIG') {
+        await send(msg.chatId, `${raw}\n· 想让我读：面板把「单本最大 MB」调大\n· 更快：直接把文件拷到 ${shelf}，我 5 分钟内自己收`)
+        return true
+      }
+      const short = /超时/.test(raw) ? '下载超时（QQ 文件通道太慢）'
+        : (raw.match(/HTTP \d{3}/) || [])[0]
+        || (/file_id not found|没给出文件下载地址/i.test(raw) ? 'QQ 没给出下载地址' : raw.replace(/\s+/g, ' ').slice(0, 40))
+      await send(msg.chatId, `文件没拿到：${short}\n直接把文件拷到 ${shelf} 更快，我 5 分钟内自己收；急的话发 /小说 刷新。`)
     }
     return true
   }
@@ -811,7 +1276,12 @@ export function createOps({ api, store = createStore(api) }) {
 
   async function tick() {
     if (settings().autoScan === false) return
-    scanShelf({ limit: 5 })
+    const results = scanShelf({ limit: 5 })
+    // 书架里的文件没进书架（太大 / 读不了）时跟主人说一声，别让她以为收了
+    const bad = (results || []).filter((r) => r && r.ok === false)
+    const owner = String(api.config?.()?.ownerQQ || '')
+    if (!bad.length || !owner) return
+    await send(`private:${owner}`, `书架里有文件没进书架：\n${bad.map((r) => `· ${r.message}`).join('\n')}`)
   }
 
   function dispose() {
@@ -844,6 +1314,8 @@ export function createOps({ api, store = createStore(api) }) {
     stopLearning,
     startReading,
     stopReading,
+    lookPage,
+    isComic,
     importBuffer,
     importPath,
     importUrl,
