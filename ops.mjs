@@ -593,6 +593,9 @@ export function createOps({ api, store = createStore(api) }) {
   }
 
   async function assertCanSee() {
+    if (settings().comicVision === false) {
+      throw new Error('「看漫画时真的看图」关着（面板「扩展」→「看小说 / 漫画」里打开，才能一页页看）')
+    }
     const see = await visionState()
     if (see === false) {
       throw new Error('当前模型看不了图：面板「模型」里换一个支持视觉的，或者把「视觉能力」设成 on')
