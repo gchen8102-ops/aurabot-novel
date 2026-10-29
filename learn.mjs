@@ -154,7 +154,7 @@ const MERGE_PROMPT = ({ title, payload, extra }) => [
   '',
   '要求：',
   '- 按重要程度排序，最多 10 个人物',
-  '- 同一个人换了称呼、译名不同、或者一段用外貌称呼一段用本名的，按身份合并成一条（比如「男學生」和「津田隆利」是同一个人）',
+  '- 同一个人的简体 / 繁体写法、外貌称呼、译名、本名必须合并成一条（例：「七条天空」和「七條天空」；「短黑髮男學生」「短黑发男学生」「津田隆利」；name 统一用简体本名，quotes 保留画面原文）',
   '- 不要编造笔记里没有的情节和台词',
   '- 每个人物尽量写清楚「他说话是什么味道」，让别人只看这段就能模仿',
   String(extra || '').trim() ? `- 主人的额外要求（优先满足）：${String(extra).trim()}` : '',
@@ -216,7 +216,75 @@ export async function synthesize(api, { title, notes, strength, extra }) {
   )
   let profile = normProfile(parseJson(raw) || {}, notes)
   if (!profile) profile = mergeLocal(notes)
+  if (profile?.characters?.length) {
+    profile.characters = await mergeAliasGroups(api, { title, characters: profile.characters })
+  }
   return profile
+}
+
+// 模型合并时经常把同一个人写成两个名字：本名一个、外貌称呼一个，或者简体繁体各一个。
+// 光靠提示词不保险（实测会留下「七条天空 / 七條天空」「短黑髮男學生 / 短黑发男学生」），
+// 最后再花一次很小的纯文本调用，专门把这些名字分组，然后在本地合并字段。
+
+const ALIAS_PROMPT = ({ title, list }) => [
+  `下面是《${title}》里抽出的人物（可能有同一个人被写成不同名字：本名、外貌称呼、简体 / 繁体、译名）。`,
+  '请找出其实是同一个人的名字，合并成组；每组第一个写最常用的正式名字（有本名就用本名）。',
+  '',
+  '只输出这样的 JSON：',
+  '{"groups":[["正式名","别名1","别名2"]]}',
+  '',
+  '要求：',
+  '- 不同的人不要合并；拿不准就单独一组，或者干脆不列',
+  '- 只输出 JSON，不要解释',
+  '',
+  JSON.stringify(list),
+].join('\n')
+
+function applyAliasGroups(characters, groups) {
+  const existing = new Set(characters.map((c) => c.name))
+  const canon = new Map()
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const names = (Array.isArray(group) ? group : []).filter((n) => typeof n === 'string' && existing.has(n))
+    if (names.length < 2) continue
+    for (const n of names) canon.set(n, names[0])
+  }
+  if (!canon.size) return characters
+
+  const merged = new Map()
+  const order = []
+  for (const c of characters) {
+    const key = canon.get(c.name) || c.name
+    const cur = merged.get(key)
+    if (!cur) {
+      merged.set(key, { ...c, name: key })
+      order.push(key)
+      continue
+    }
+    // 同一个人：字段取更详细的那份，原话 / 口头禅去重合并
+    for (const k of ['role', 'personality', 'speech', 'behavior']) {
+      if ((c[k] || '').length > (cur[k] || '').length) cur[k] = c[k]
+    }
+    cur.quotes = [...new Set([...(cur.quotes || []), ...(c.quotes || [])])].slice(0, 3)
+    cur.catchphrases = [...new Set([...(cur.catchphrases || []), ...(c.catchphrases || [])])].slice(0, 6)
+  }
+  return order.map((k) => merged.get(k))
+}
+
+/** 让模型只做「哪些名字是同一个人」这一件事，然后在本地合并。失败就原样返回。 */
+export async function mergeAliasGroups(api, { title, characters }) {
+  if (!Array.isArray(characters) || characters.length < 2) return characters
+  try {
+    const list = characters.map((c) => ({ name: c.name, role: c.role }))
+    const raw = await withTimeout(
+      api.ask({ system: SYSTEM, text: ALIAS_PROMPT({ title, list }), maxTokens: 800, reasoningEffort: 'off' }),
+      120000,
+      '合并人物别名',
+    )
+    const json = parseJson(raw)
+    return applyAliasGroups(characters, json?.groups)
+  } catch (error) {
+    return characters
+  }
 }
 
 /** 模型最终合并失败时的兜底：把各段里同一个人物的信息拼起来。 */

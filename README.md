@@ -13,7 +13,7 @@ Aurabot 扩展模块：**读小说、看漫画，学书里角色说话做事**�
 **从 Release 下 zip，解压到 Aurabot 的扩展目录**：
 
 ```powershell
-Expand-Archive .\aurabot-novel-1.2.0.zip -DestinationPath "$env:USERPROFILE\.dsh\plugins-data\aurabot\modules" -Force
+Expand-Archive .\aurabot-novel-1.2.1.zip -DestinationPath "$env:USERPROFILE\.dsh\plugins-data\aurabot\modules" -Force
 ```
 
 解压后应该是 `...\modules\novel\index.mjs`。几秒内面板「扩展」页会出现「看小说 / 漫画」，显示「已启动」就好了。

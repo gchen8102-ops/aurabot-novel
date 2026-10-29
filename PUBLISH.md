@@ -1,7 +1,7 @@
 # 发布攻略（aurabot-novel）
 
 > 对象：Aurabot 扩展模块「看小说 / 漫画」。发出去之后，别人解压到自己的 `modules/` 就能用。
-> 跟着抄命令就行，每步都给了验证方法。当前版本 **1.2.0**。
+> 跟着抄命令就行，每步都给了验证方法。当前版本 **1.2.1**。
 
 ---
 
@@ -40,7 +40,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
 3. 压成 `dist\aurabot-novel-<版本>.zip`（zip 里有一层 `novel/`，解压到 `modules` 就位）
 4. 打印每个文件的大小 + SHA256，并检查包里有没有混进样书 / 备份（有就报错）
 
-1.2.0 的 zip 应该包含：
+1.2.1 的 zip 应该包含：
 
 ```text
 index.mjs  ops.mjs  store.mjs  text.mjs  textutil.mjs  zip.mjs
@@ -89,25 +89,28 @@ http.sslBackend = openssl
 1. 先打 tag 并推上去：
 
    ```powershell
-   git tag v1.2.0
-   git push origin v1.2.0
+   git tag v1.2.1
+   git push origin v1.2.1
    ```
 
 2. 仓库页 → **Releases** → **Draft a new release**
-3. Tag：`v1.2.0`；标题：`看小说 1.2.0 —— 支持图片版漫画 PDF`
-4. 说明直接贴 `CHANGELOG.md` 里 1.2.0 那段，末尾补一句「需要能看图的模型（DeepSeek-V4.1-Flash）」
-5. 附件拖 `dist\aurabot-novel-1.2.0.zip` 上去
+3. Tag：`v1.2.1`；标题：`看小说 1.2.1 —— 人物卡简繁 / 别名去重`
+4. 说明贴 `CHANGELOG.md` 里 1.2.1 那段；1.2.0 的功能说明可以附在下面（新装的人看）
+5. 附件拖 `dist\aurabot-novel-1.2.1.zip` 上去
 6. Publish
 
 > 没有 `gh` CLI，也不要把 token 写进命令历史。要么在网页上点，要么用环境变量里的
 > `GH_TOKEN` 调 REST API（token 不要落到仓库 / 日志里）。
 
-1.2.0 已经按这个流程发好（2026-10-29）：
+历史发布记录（2026-10-29）：
 
 ```text
-tag:    v1.2.0
-release https://github.com/gchen8102-ops/aurabot-novel/releases/tag/v1.2.0
-asset   aurabot-novel-1.2.0.zip（68,710 B，下载回来 SHA256 与本地一致）
+v1.2.0  看小说 1.2.0 —— 支持图片版漫画 PDF
+        https://github.com/gchen8102-ops/aurabot-novel/releases/tag/v1.2.0
+        附件 aurabot-novel-1.2.0.zip（68,710 B，SHA256 与本地一致）
+
+v1.2.1  人物卡简繁 / 别名去重（本补丁在 1.2.0 发布后修复）
+        https://github.com/gchen8102-ops/aurabot-novel/releases/tag/v1.2.1
 ```
 
 ---
@@ -116,7 +119,7 @@ asset   aurabot-novel-1.2.0.zip（68,710 B，下载回来 SHA256 与本地一致
 
 ```powershell
 # 下载 zip 后
-Expand-Archive .\aurabot-novel-1.2.0.zip -DestinationPath "$env:USERPROFILE\.dsh\plugins-data\aurabot\modules" -Force
+Expand-Archive .\aurabot-novel-1.2.1.zip -DestinationPath "$env:USERPROFILE\.dsh\plugins-data\aurabot\modules" -Force
 ```
 
 目录应该是 `...\modules\novel\index.mjs`。几秒内面板「扩展」页会出现「看小说 / 漫画」并且「已启动」。
@@ -183,6 +186,14 @@ node test.mjs
 /小说 读 妄想学生会_01     # 每段 6 页，抽 3 段
 → 认出 天草篠 / 男學生；第 1-6、79-84、151-156 页拆出剧情
 → 合并人物卡把「男學生」和「津田隆利」并成一条，最后 2 个人物
+```
+
+1.2.1 实测（全 156 页看完）：
+
+```text
+/小说 读 妄想学生会_01     # 26 段 × 6 页，全看完
+→ status=done pages=156/156
+→ 去重前 10 条人物 → 去重后 6 条：天草篠、津田隆利、七条天空、萩村鈴、橫島鳴子、津田琴美
 ```
 
 ---

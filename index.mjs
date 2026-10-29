@@ -16,7 +16,7 @@ import { createOps } from './ops.mjs'
 export default {
   id: 'novel',
   name: '看小说 / 漫画',
-  version: '1.2.0',
+  version: '1.2.1',
   api: 1,
   description: '读小说和漫画（txt / docx / epub / pdf），学书里角色的性格、说话和做事方式',
 
