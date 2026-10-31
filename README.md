@@ -20,7 +20,6 @@ Expand-Archive .\aurabot-novel-1.2.1.zip -DestinationPath "$env:USERPROFILE\.dsh
 
 - 升级：把 `modules\novel` 整个删掉，再解压新的。书架数据在 `modules-data\novel`，不会丢。
 - 卸载：删掉 `modules\novel`；想连数据一起清空，再删 `modules-data\novel`。
-- 这**不是** DSH 插件，不能 `dsh plugin add`；它是 Aurabot 的扩展模块，放在 `modules/` 下由 Aurabot 自己加载。
 
 ## 怎么把书给她
 
