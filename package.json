@@ -24,15 +24,8 @@
     "test": "node test.mjs",
     "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1"
   },
-  "dsh": {
-  "bundle": {
-    "patch": "./cordis.patch.yml"
-  }
-},
   "keywords": [
     "aurabot",
-    "dsh",
-    "dsh-plugin",
     "aurabot-module",
     "novel",
     "epub",
